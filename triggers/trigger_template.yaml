@@ -1,0 +1,49 @@
+apiVersion: triggers.tekton.dev/v1alpha1
+kind: TriggerTemplate
+metadata:
+  name: github-template
+spec:
+  params:
+    - name: gitrevision
+    - name: gitrepositoryurl
+    - name: gitprurl
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1beta1
+      kind: PipelineRun
+      metadata:
+        generateName: playbook-signing-
+      spec:
+        serviceAccountName: tekton-triggers-example-sa
+        pipelineRef:
+          name: playbook-signing-pipeline
+        params:
+        - name: GIT_REQUEST_URL
+          value: $(tt.params.gitprurl)
+        - name: GIT_HEAD_REVISION
+          value: "ci-automated"
+        - name: GIT_USER_NAME
+          value: "hirokuni-kitahara"
+        - name: GIT_USER_EMAIL
+          value: "hirokuni.kitahara1@ibm.com"
+        workspaces:
+        - name: git-ssh-config
+          secret:
+            secretName: github-credentials
+        - name: shared
+          volumeClaimTemplate:
+            spec:
+              accessModes:
+                - ReadWriteOnce
+              resources:
+                requests:
+                  storage: 50Mi
+        resources:
+        - name: git-source
+          resourceSpec:
+            type: git
+            params:
+              - name: revision
+                value: $(tt.params.gitrevision)
+              - name: url
+                value: $(tt.params.gitrepositoryurl)
+

@@ -1,0 +1,35 @@
+apiVersion: triggers.tekton.dev/v1alpha1
+kind: EventListener
+metadata:
+  name: github-listener-interceptor
+spec:
+  triggers:
+    - name: github-listener
+      interceptors:
+        - github:
+            secretRef:
+              secretName: github-interceptor-secret
+              secretKey: secretToken
+            eventTypes:
+              - pull_request
+        - cel:
+            # this example signs playbooks when PR is submitted from `ci-automated`` branch
+            filter: "body.pull_request.head.ref == 'ci-automated'"
+      bindings:
+        - ref: github-push-binding
+      template:
+        ref: github-template
+  resources:
+    kubernetesResource:
+      spec:
+        template:
+          spec:
+            serviceAccountName: tekton-triggers-example-sa
+            containers:
+              - resources:
+                  requests:
+                    memory: "64Mi"
+                    cpu: "250m"
+                  limits:
+                    memory: "128Mi"
+                    cpu: "500m"

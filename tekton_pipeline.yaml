@@ -1,0 +1,347 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: playbook-signing-pipeline
+spec:
+  params:
+  - name: GIT_COMMIT_MSG
+    type: string
+    default: "sign playbook content by tekton task"
+  - name: GIT_REQUEST_URL
+    type: string
+  - name: GIT_USER_NAME
+    type: string
+  - name: GIT_USER_EMAIL
+    type: string
+  - name: GIT_HEAD_REVISION
+    type: string
+  workspaces:
+  - name: git-ssh-config
+  - name: shared
+  resources:
+  - name: git-source
+    type: git
+
+  tasks:
+  # 1. check-latest-commit
+  - name: check-latest-commit
+    taskRef:
+      name: check-latest-commit
+    params:
+    - name: COMMIT_MSG
+      value: $(params.GIT_COMMIT_MSG)
+    workspaces:
+    - name: shared
+      workspace: shared
+    resources:
+      inputs:
+      - name: source
+        resource: git-source
+  # 2. verify-dependencies
+  - name: verify-dependencies
+    taskRef:
+      name: verify-dependencies
+    runAfter:
+    - check-latest-commit
+    workspaces:
+    - name: shared
+      workspace: shared
+    resources:
+      inputs:
+      - name: source
+        resource: git-source
+  # 3. sign
+  - name: sign
+    taskRef:
+      name: sign
+    runAfter:
+    - verify-dependencies
+    workspaces:
+    - name: shared
+      workspace: shared
+    resources:
+      inputs:
+      - name: source
+        resource: git-source
+  # 4. result-to-github
+  - name: result-to-github
+    taskRef:
+      name: result-to-github
+    runAfter:
+    - sign
+    params:
+    - name: REQUEST_URL
+      value: $(params.GIT_REQUEST_URL)
+    - name: GIT_USER_NAME
+      value: $(params.GIT_USER_NAME)
+    - name: GIT_USER_EMAIL
+      value: $(params.GIT_USER_EMAIL)
+    - name: COMMIT_MSG
+      value: $(params.GIT_COMMIT_MSG)
+    - name: HEAD
+      value: $(params.GIT_HEAD_REVISION)
+    workspaces:
+    - name: ssh-directory
+      workspace: git-ssh-config
+    - name: shared
+      workspace: shared
+    resources:
+      inputs:
+      - name: source
+        resource: git-source
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: check-latest-commit
+spec:
+  params:
+  - name: COMMIT_MSG
+    type: string
+  workspaces:
+  - name: shared
+  resources:
+    inputs:
+    - name: source
+      type: git
+  steps:
+  - name: check-latest-commit
+    image: docker.io/alpine/git:v2.26.2@sha256:23618034b0be9205d9cc0846eb711b12ba4c9b468efdd8a59aac1d7b1a23363f #tag: v2.26.2
+    script: |
+      #!/bin/ash
+      set -eu
+      set -x
+
+      cd $(resources.inputs.source.path)
+
+      latest_commit_msg=$(git log --format="%s" -n 1)
+      echo "latest_commit_msg: $latest_commit_msg"
+      if [[ "$latest_commit_msg" == "$(params.COMMIT_MSG)" ]]; then
+        echo "This TaskRun is triggered by the latest commit by this tekton task."
+        echo "Do nothing in the TaskRun to avoid infinite loop."
+        touch $(workspaces.shared.path)/should_skip
+        exit 0
+      fi
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: verify-dependencies
+spec:
+  workspaces:
+  - name: shared
+  resources:
+    inputs:
+    - name: source
+      type: git
+  steps:
+  - name: verify-dependencies
+    image: ghcr.io/hirokuni-kitahara/ansible-collection-analyzer:dev
+    imagePullPolicy: Always
+    script: |
+      #!/bin/bash
+      set -eu
+      set -x
+
+      if [ -f $(workspaces.shared.path)/should_skip ]; then
+        echo "skip this step"
+        exit 0
+      fi
+
+      ls -l $(resources.inputs.source.path)
+
+      cd /app
+      python src/analyzer.py -r $(resources.inputs.source.path)/meta/requirements.yml -p test-dir/policy.yaml -d test-dir/tmp -o test-dir/result.json
+      if [ ! -f test-dir/result.json ]; then
+        msg="Analysis for collections/roles has failed. \"test-dir/result.json\" was not generated."
+        echo $msg
+        echo $msg > $(workspaces.shared.path)/verify-fail
+        exit 1
+      fi
+      invalid_coll=$(cat test-dir/result.json | jq .collections | jq '[.[] | select(.valid==false)] | length')
+      invalid_role=$(cat test-dir/result.json | jq .roles | jq '[.[] | select(.valid==false)] | length')
+      invalid_num=$((invalid_coll + invalid_role))
+
+      if [[ "$invalid_num" -gt "0" ]]; then
+        result=$(cat test-dir/result.json)
+        msg="$invalid_num collections/roles are invalid for the policy. The detail results are the following;\n\n$result"
+        echo -e "$msg"
+        echo -e "$msg" > $(workspaces.shared.path)/verify-fail
+        exit 1
+      fi
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: sign
+spec:
+  workspaces:
+  - name: shared
+  resources:
+    inputs:
+    - name: source
+      type: git
+  steps:
+  - name: sign
+    image: ghcr.io/hirokuni-kitahara/playbook-sign-runner:dev
+    imagePullPolicy: Always
+    script: |
+      #!/bin/bash
+      
+      if [ -f $(workspaces.shared.path)/should_skip ]; then
+        echo "skip this step"
+        exit 0
+      fi
+
+      if [ -f $(workspaces.shared.path)/verify-fail ]; then
+        echo "verification failed. skip this step"
+        exit 0
+      fi
+
+      echo "echo UID"
+      echo $UID
+
+      echo "add signer user"
+      echo "signer:x:$UID:0:,,,:/workspace:/bin/bash" >> /etc/passwd
+
+      echo "pwd.getpwuid()"
+      python -c "import pwd; uid=pwd.getpwuid($UID); print(uid)"
+
+      echo "run sign playbook"
+      chmod 0600 /etc/cosign.key
+      ansible-playbook /playbook-integrity-collection/playbooks/sign-playbook.yml -e repo=$(resources.inputs.source.path) -e sigtype=sigstore -e key=/etc/cosign.key
+      mkdir $(workspaces.shared.path)/sigfiles
+      cp $(resources.inputs.source.path)/sha256sum* $(workspaces.shared.path)/sigfiles/
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: result-to-github
+spec:
+  params:
+  - name: GITHUB_TOKEN_SECRET_NAME
+    type: string
+    default: github
+  - name: GITHUB_TOKEN_SECRET_KEY
+    type: string
+    default: token
+  - name: GITHUB_HOST_URL
+    default: "api.github.com"
+    type: string
+  - name: REQUEST_URL
+    type: string
+  - name: GIT_USER_NAME
+    type: string
+  - name: GIT_USER_EMAIL
+    type: string
+  - name: COMMIT_MSG
+    type: string
+  - name: HEAD
+    type: string
+  - name: USER_HOME
+    type: string
+    default: "/tekton/home"
+  workspaces:
+  - name: ssh-directory
+  - name: shared
+  resources:
+    inputs:
+    - name: source
+      type: git
+  steps:
+  - name: post-comment-if-verify-failed
+    env:
+      - name: GITHUBTOKEN
+        valueFrom:
+          secretKeyRef:
+            name: $(params.GITHUB_TOKEN_SECRET_NAME)
+            key: $(params.GITHUB_TOKEN_SECRET_KEY)
+
+    image: registry.access.redhat.com/ubi8/ubi-minimal:8.2
+    script: |
+      #!/usr/libexec/platform-python
+      import json
+      import os
+      import http.client
+      import sys
+      import urllib.parse
+
+      commentParamValue = """$(workspaces.shared.path)/verify-fail"""
+      if not os.path.exists(commentParamValue):
+        sys.exit(0)
+
+      githubToken = os.environ["GITHUBTOKEN"].strip()
+      authHeader = "Bearer " + githubToken
+      split_url = urllib.parse.urlparse(
+          "$(params.REQUEST_URL)").path.split("/")
+      # This will convert https://github.com/foo/bar/pull/202 to
+      # api url path /repos/foo/issues/
+      api_url = "{base}/repos/{package}/issues/{id}".format(
+        base="", package="/".join(split_url[1:3]), id=split_url[-1])
+      
+      # check if workspace is bound and parameter passed is a filename or not
+      if os.path.exists(commentParamValue):
+        commentParamValue = open(commentParamValue, "r").read()
+      # If a tag was specified, append it to the (commentParamValue
+      data = {
+          "body": commentParamValue,
+      }
+      # This is for our fake github server
+      if "$(params.GITHUB_HOST_URL)".startswith("http://"):
+        conn = http.client.HTTPConnection("$(params.GITHUB_HOST_URL)".replace("http://", ""))
+      else:
+        conn = http.client.HTTPSConnection("$(params.GITHUB_HOST_URL)")
+      method = "POST"
+      target_url = api_url + "/comments"
+      print("Sending this data to GitHub with {}: ".format(method))
+      print(data)
+      r = conn.request(
+          method,
+          target_url,
+          body=json.dumps(data),
+          headers={
+              "User-Agent": "TektonCD, the peaceful cat",
+              "Authorization": authHeader,
+          })
+      resp = conn.getresponse()
+      if not str(resp.status).startswith("2"):
+          print("Error: %d" % (resp.status))
+          print(resp.read())
+          sys.exit(1)
+      else:
+          print("a GitHub comment has been added to $(params.REQUEST_URL)")
+          
+  - name: push-changes
+    image: docker.io/alpine/git:v2.26.2@sha256:23618034b0be9205d9cc0846eb711b12ba4c9b468efdd8a59aac1d7b1a23363f #tag: v2.26.2
+    script: |
+      #!/bin/ash
+      set -eu
+      set -x
+
+      if [ -f $(workspaces.shared.path)/should_skip ]; then
+        echo "skip this step"
+        exit 0
+      fi
+
+      if [ -f $(workspaces.shared.path)/verify-fail ]; then
+        echo "verification failed. skip this step"
+        exit 0
+      fi
+
+      cd $(resources.inputs.source.path)
+      ls -l $(workspaces.shared.path)/
+      ls -l $(workspaces.shared.path)/sigfiles
+      cp $(workspaces.shared.path)/sigfiles/* $(resources.inputs.source.path)
+
+      cp -R $(workspaces.ssh-directory.path) $(params.USER_HOME)/.ssh
+      chmod 700 "$(params.USER_HOME)"/.ssh
+      chmod -R 400 "$(params.USER_HOME)"/.ssh/*
+
+      git config --global user.email "$(params.GIT_USER_EMAIL)"
+      git config --global user.name "$(params.GIT_USER_NAME)"
+      git config --global url."git@github.com:".insteadOf "https://github.com/"
+
+      git checkout -b $(params.HEAD)
+      git add sha256sum*
+      git commit -s -m "$(params.COMMIT_MSG)"
+      git push origin $(params.HEAD) -f
